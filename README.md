@@ -41,4 +41,4 @@ Pasta raiz/
 - `Sicredi`
 - `XP`
 
-> A subpasta deve ser chamada exatamente `Aplicação` ou `Aplicacao`.
+> A subpasta deve ser chamada exatamente `Aplicação`
