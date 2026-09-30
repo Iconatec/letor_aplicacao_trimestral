@@ -1,0 +1,1358 @@
+from __future__ import annotations
+
+import ctypes
+import os
+import re
+import sys
+import threading
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+import pymupdf as fitz
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from PIL import Image, ImageOps
+
+# BANCOS: 001 - CAIXA ECONÔMICA, BB (2 tipos), BRADESCO, SICREDI, XP, ITAÚ
+
+COLUNAS = [
+    "Arquivo",
+    "Cliente",
+    "Banco",
+    "Conta",
+    "Mês",
+    "Saldo Anterior",
+    "Aplicações",
+    "Resgates",
+    "Rendimento bruto mês",
+    "IRRF",
+    "IOF",
+    "Saldo Bruto",
+    "Check",
+    "Status",
+]
+
+COLUNAS_ERROS = ["Arquivo", "Banco", "Status", "Motivo"]
+
+COLUNAS_MONETARIAS = {
+    "Saldo Anterior",
+    "Aplicações",
+    "Resgates",
+    "Rendimento bruto mês",
+    "IRRF",
+    "IOF",
+    "Saldo Bruto",
+    "Check",
+}
+
+COR_CABECALHO = "2B6BA5"
+
+
+def extrair_campo(texto: str, rotulo: str):
+    m = re.search(rotulo + r"\s*([0-9.]+,\d{2}[CD]?)", texto, re.I)
+    return m.group(1).rstrip("CD").rstrip("cd") if m else "0,00"
+
+
+def extrair_mes_ano(texto: str, rotulo: str):
+    m = re.search(rotulo + r"\s*(\d{2}/\d{4})", texto, re.I)
+    return m.group(1) if m else ""
+
+
+def extrair_mes_ano_referencia_bb(texto: str):
+    m = re.search(r"M[êe]s/ano\s+refer[êe]ncia\s+([A-ZÇÃÕ]+)/([0-9]{4})", texto, re.I)
+    if not m:
+        return ""
+    mapa = {
+        "JANEIRO": "01", "FEVEREIRO": "02", "MARÇO": "03", "MARCO": "03",
+        "ABRIL": "04", "MAIO": "05", "JUNHO": "06", "JULHO": "07",
+        "AGOSTO": "08", "SETEMBRO": "09", "OUTUBRO": "10",
+        "NOVEMBRO": "11", "DEZEMBRO": "12",
+    }
+    mes_nome = re.sub(r"[\u0300-\u036f]", "", m.group(1).upper())
+    mes_num = mapa.get(mes_nome)
+    return f"{mes_num}/{m.group(2)}" if mes_num else ""
+
+
+def extrair_mes_ano_resumo_bb(texto: str):
+    m = re.search(r"Resumo do mês\s*-\s*([A-Za-zçãõáéíóú]+)/([0-9]{4})", texto)
+    if not m:
+        return ""
+    mapa = {
+        "janeiro": "01", "fevereiro": "02", "março": "03", "marco": "03",
+        "abril": "04", "maio": "05", "junho": "06", "julho": "07",
+        "agosto": "08", "setembro": "09", "outubro": "10",
+        "novembro": "11", "dezembro": "12",
+    }
+    mes_nome = re.sub(r"[\u0300-\u036f]", "", m.group(1).lower())
+    mes_num = mapa.get(mes_nome)
+    return f"{mes_num}/{m.group(2)}" if mes_num else ""
+
+
+def formatar_nome(nome: str) -> str:
+    nome = re.sub(r"\n+", " ", nome)
+    nome = re.sub(r"\s+", " ", nome).strip().lower()
+    nome = re.sub(r"\b\w", lambda m: m.group(0).upper(), nome)
+    for p, r in [
+        (r"\bSpe\b", "SPE"),
+        (r"\bLtda\b", "LTDA"),
+        (r"\bS/a\b", "S/A"),
+        (r"\bEireli\b", "EIRELI"),
+        (r"\bMe\b", "ME"),
+        (r"\bEpp\b", "EPP"),
+    ]:
+        nome = re.sub(p, r, nome, flags=re.I)
+    return nome
+
+
+def extrair_nome_cliente_generico(texto_original: str):
+    match = re.search(
+        r"Cliente[\s\S]*?Nome\s*\n\s*([\s\S]*?)"
+        r"(?=\n\s*(?:CPF\/CNPJ|Conta Corrente|M[eê]s/Ano|Folha|An[aá]lise do Perfil do Investidor|Data da Avalia[cç][aã]o)\b)",
+        texto_original,
+        re.I,
+    )
+    return formatar_nome(match.group(1)) if match else ""
+
+
+def extrair_nome_cliente_bb(texto_original: str):
+    linha = re.search(r"Conta\s+\d{1,20}-\d+\s+(.+)\n", texto_original, re.I)
+    if linha:
+        bruto = re.sub(r"\s+", " ", linha.group(1)).strip()
+        if bruto.lower() != "cliente" and len(bruto) > 3:
+            return formatar_nome(bruto)
+
+    linhas = texto_original.splitlines()
+    for i in range(len(linhas) - 1, -1, -1):
+        if linhas[i].strip().lower() == "cliente" and i + 1 < len(linhas):
+            candidato = linhas[i + 1].strip()
+            if len(candidato) >= 3 and any(c.isalpha() for c in candidato):
+                return formatar_nome(candidato)
+    return ""
+
+
+def extrair_texto_pdf(caminho_pdf: Path) -> str:
+    doc = fitz.open(caminho_pdf)
+    try:
+        return "".join(pagina.get_text() for pagina in doc)
+    finally:
+        doc.close()
+
+
+def extrair_valor_proxima_linha(texto: str, rotulo: str):
+    m = re.search(rf"{rotulo}\s*\n\s*([0-9.]+,\d{{2}})", texto, re.I)
+    return m.group(1) if m else "0,00"
+
+
+def extrair_valor(texto: str, padrao: str):
+    m = re.search(padrao + r"\s*:?\s*R?\s*\$?\s*([0-9.]+,\d{2})", texto, re.I)
+    return m.group(1) if m else "0,00"
+
+
+def texto_para_numero(valor):
+    if not valor or valor == "0,00":
+        return 0.0
+    valor = str(valor).replace("R$", "").replace(" ", "")
+    negativo = valor.startswith("-")
+    valor = valor.lstrip("-")
+    numero = float(valor.replace(".", "").replace(",", "."))
+    return -numero if negativo else numero
+
+
+# --------------------------------------------------------------------------
+# Contas, clientes e períodos
+# --------------------------------------------------------------------------
+
+def extrair_conta_bb(texto_original: str):
+    match = re.search(r"Conta\s+(\d{1,20}-\d+)", texto_original)
+    if match:
+        return match.group(1)
+    match = re.search(r"Conta\s*\n\s*(\d{1,20}-\d+)", texto_original)
+    return match.group(1) if match else ""
+
+
+def extrair_conta_bradesco(texto_original: str):
+    match = re.search(r"Produto:\s*\n?\s*\d+\s*\|\s*(\d+-\d+)", texto_original, re.I)
+    return match.group(1) if match else ""
+
+
+def extrair_conta_caixa(texto: str) -> str:
+    match = re.search(r"Conta Corrente\s*\n?[\d.]*000(\d{6,20})\s*-\s*(\d)", texto, re.I)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    match = re.search(r"\d+\s*/\s*\d+\s*/\s*(\d{6,20})\s*-\s*(\d)", texto)
+    return f"{match.group(1)}-{match.group(2)}" if match else ""
+
+
+def extrair_conta_sicredi_poupanca(texto: str) -> str:
+    match = re.search(r"(\d{4,6}-\d)\s*\n?\s*Conta Poupança:", texto, re.I)
+    if match:
+        return match.group(1)
+    match = re.search(r"\b(\d{4,6}-\d)\b", texto)
+    return match.group(1) if match else ""
+
+
+def extrair_conta_sicredi_prazo(texto: str) -> str:
+    match = re.search(r"(\d{6,7})\s*\n?\s*Conta Corrente:", texto, re.I)
+    if match:
+        return match.group(1)
+    match = re.search(r"Associado:\s*[^\n]+\n\s*(\d{6,7})", texto, re.I)
+    return match.group(1) if match else ""
+
+
+def extrair_conta_xp(texto: str) -> str:
+    match = re.search(r"Data de Referência\s*\n\s*(\d+)", texto, re.I)
+    return match.group(1) if match else ""
+
+
+def extrair_mes_sicredi(texto: str) -> str:
+    match = re.search(r"Produto:\s*\n?\s*(\d{2}/\d{4})\s*a\s*(\d{2}/\d{4})", texto, re.I)
+    if match:
+        return match.group(1)
+    match = re.search(r"\b(\d{2}/\d{4})\b", texto)
+    return match.group(1) if match else ""
+
+
+def extrair_mes_xp(texto: str) -> str:
+    match = re.search(r"Data de referência:\s*(\d{2})/(\d{2})/(\d{4})", texto, re.I)
+    return f"{match.group(2)}/{match.group(3)}" if match else ""
+
+
+def extrair_cliente_sicredi(texto: str) -> str:
+    match = re.search(r"Associado:\s*([^\n]+)", texto, re.I)
+    return formatar_nome(match.group(1)) if match else ""
+
+
+def extrair_conta_itau(texto: str) -> str:
+    match = re.search(r"Ag[êe]ncia/conta:\s*\d{1,5}-(\d{4,12}-\d)", texto, re.I)
+    return match.group(1) if match else ""
+
+
+def extrair_mes_itau(texto: str) -> str:
+    match = re.search(r"Movimenta[çc][ãa]o\s+em\s+([A-Za-zçãõáéíóú]+)/\s*(\d{4})", texto, re.I)
+    if not match:
+        return ""
+    mapa = {
+        "janeiro": "01", "fevereiro": "02", "março": "03", "marco": "03",
+        "abril": "04", "maio": "05", "junho": "06", "julho": "07",
+        "agosto": "08", "setembro": "09", "outubro": "10",
+        "novembro": "11", "dezembro": "12",
+    }
+    nome_mes = re.sub(r"[\u0300-\u036f]", "", match.group(1).lower())
+    mes = mapa.get(nome_mes)
+    return f"{mes}/{match.group(2)}" if mes else ""
+
+
+def extrair_cliente_itau(texto: str) -> str:
+    match = re.search(r"Cliente:\s*([^\n]+)", texto, re.I)
+    return formatar_nome(match.group(1)) if match else ""
+
+def eh_itau_fundos_investimento(texto: str) -> bool:
+    return bool(
+        re.search(
+            r"Extrato\s+de\s+Fundos\s+de\s+Investimento",
+            texto,
+            re.I,
+        )
+    )
+
+def valores_itau_fundos(
+    texto: str,
+    rotulo: str,
+) -> list[float]:
+    padrao = (
+        rf"{rotulo}"
+        rf"\s*"
+        rf"(?:\n|\s)+"
+        rf"((?:[0-9.]+,\d{{2,5}})"
+        rf"(?:\s+(?:[0-9.]+,\d{{2,5}}))*)"
+    )
+
+    encontrados = list(
+        re.finditer(
+            padrao,
+            texto,
+            re.I,
+        )
+    )
+
+    if not encontrados:
+        return []
+
+    trecho = encontrados[-1].group(1)
+
+    numeros = re.findall(
+        r"[0-9.]+,\d{2,5}",
+        trecho,
+    )
+
+    return [
+        texto_para_numero(numero)
+        for numero in numeros
+    ]
+
+
+def valor_itau_reais(
+    texto: str,
+    rotulo: str,
+) -> float:
+    valores = valores_itau_fundos(
+        texto,
+        rotulo,
+    )
+
+    if not valores:
+        return 0.0
+
+    # Nos fundos do Itaú, a primeira coluna é quantidade
+    # de cotas e a segunda coluna é o valor em reais.
+    if len(valores) >= 2:
+        return valores[1]
+
+    return valores[0]
+
+# --------------------------------------------------------------------------
+# Processadores
+# --------------------------------------------------------------------------
+
+def processar_extrato_caixa(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    texto = re.sub(r"\s+", " ", texto_original).strip()
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": extrair_nome_cliente_generico(texto_original),
+        "Conta": extrair_conta_caixa(texto_original),
+        "Mês": extrair_mes_ano(texto, r"M[eê]s/Ano"),
+        "Saldo Anterior": texto_para_numero(extrair_campo(texto, r"Saldo Anterior")),
+        "Aplicações": texto_para_numero(extrair_campo(texto, r"Aplicaç[õo]es")),
+        "Resgates": texto_para_numero(extrair_campo(texto, r"Resgates")),
+        "Rendimento bruto mês": texto_para_numero(extrair_campo(texto, r"Rendimento Bruto no M[eê]s")),
+        "IRRF": texto_para_numero(extrair_campo(texto, r"IRRF")),
+        "IOF": texto_para_numero(extrair_campo(texto, r"IOF")),
+        "Saldo Bruto": texto_para_numero(extrair_campo(texto, r"Saldo Bruto\*?")),
+        "Banco": "CEF",
+    }
+
+
+
+
+
+def processar_extrato_bb(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": extrair_nome_cliente_bb(texto_original),
+        "Conta": extrair_conta_bb(texto_original),
+        "Mês": extrair_mes_ano_referencia_bb(texto_original),
+        "Saldo Anterior": texto_para_numero(extrair_valor_proxima_linha(texto_original, r"SALDO ANTERIOR")),
+        "Aplicações": texto_para_numero(extrair_valor_proxima_linha(texto_original, r"APLICAÇÕES \(\+\)")),
+        "Resgates": texto_para_numero(extrair_valor_proxima_linha(texto_original, r"RESGATES \(-\)")),
+        "Rendimento bruto mês": texto_para_numero(extrair_valor_proxima_linha(texto_original, r"RENDIMENTO BRUTO \(\+\)")),
+        "IRRF": texto_para_numero(extrair_valor_proxima_linha(texto_original, r"IMPOSTO DE RENDA \(-\)")),
+        "IOF": texto_para_numero(extrair_valor_proxima_linha(texto_original, r"IOF \(-\)")),
+        "Saldo Bruto": texto_para_numero(extrair_valor_proxima_linha(texto_original, r"SALDO ATUAL =")),
+        "Banco": "BB",
+    }
+
+
+def processar_extrato_bb_resumo(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    texto = re.sub(r"\s+", " ", texto_original).strip()
+    ocorrencias = list(re.finditer(r"Saldo bruto em \d{2}/\d{2}/\d{4}:?\s*R?\s*\$?\s*([0-9.]+,\d{2})", texto, re.I))
+    saldo_anterior = texto_para_numero(ocorrencias[0].group(1)) if ocorrencias else 0.0
+    saldo_bruto = texto_para_numero(ocorrencias[-1].group(1)) if ocorrencias else 0.0
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": extrair_nome_cliente_bb(texto_original),
+        "Conta": extrair_conta_bb(texto_original),
+        "Mês": extrair_mes_ano_resumo_bb(texto),
+        "Saldo Anterior": saldo_anterior,
+        "Aplicações": texto_para_numero(extrair_valor(texto, r"Aplicações no mês")),
+        "Resgates": texto_para_numero(extrair_valor(texto, r"Resgates líquidos no mês")),
+        "Rendimento bruto mês": texto_para_numero(extrair_valor(texto, r"Rendimentos no mês")),
+        "IRRF": texto_para_numero(extrair_valor(texto, r"IR sobre resgates no mês")),
+        "IOF": texto_para_numero(extrair_valor(texto, r"IOF sobre resgates no mês")),
+        "Saldo Bruto": saldo_bruto,
+        "Banco": "BB",
+    }
+
+
+def extrair_blocos_total_bradesco(texto: str):
+    linhas = [linha.strip() for linha in texto.splitlines() if linha.strip()]
+    blocos = []
+    operacoes = []
+    i = 0
+
+    padrao_data = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    padrao_numero = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2,4}$")
+
+    while i < len(linhas):
+        linha = linhas[i]
+
+        if padrao_data.fullmatch(linha):
+            operacao = {
+                "dt_aplicacao": linha,
+                "dt_vencto": "",
+                "dt_resgate": "",
+            }
+
+            if i + 1 < len(linhas) and padrao_data.fullmatch(linhas[i + 1]):
+                operacao["dt_vencto"] = linhas[i + 1]
+
+            if i + 2 < len(linhas) and padrao_data.fullmatch(linhas[i + 2]):
+                operacao["dt_resgate"] = linhas[i + 2]
+
+            operacoes.append(operacao)
+            i += 1
+            continue
+
+        if linha.lower() == "total":
+            numeros = []
+            j = i + 1
+
+            while j < len(linhas):
+                encontrados = re.findall(
+                    r"\d{1,3}(?:\.\d{3})*,\d{2,4}",
+                    linhas[j],
+                )
+
+                if not encontrados:
+                    break
+
+                numeros.extend(encontrados)
+                j += 1
+
+            # O valor 0,0000 é a taxa e não pertence às colunas financeiras.
+            numeros = [numero for numero in numeros if numero != "0,0000"]
+
+            if len(numeros) >= 7:
+                blocos.append({
+                    "valores": numeros[:7],
+                    "operacoes": operacoes.copy(),
+                })
+
+            operacoes = []
+            i = j
+            continue
+
+        i += 1
+
+    return {
+        "linhas": linhas,
+        "blocos": blocos,
+    }
+
+
+
+def extrair_nome_cliente_bradesco(texto: str) -> str:
+    match = re.search(r"Agência/conta:\s*\n\s*([^\n|]+)", texto, re.I)
+    return match.group(1).strip() if match else ""
+
+
+def extrair_mes_bradesco(texto: str) -> str:
+    match = re.search(r"(\d{2}/\d{2}/\d{4})\s*\n\s*(?:até)", texto, re.I)
+    if match:
+        return match.group(1)[3:]
+    match = re.search(r"Período\s+de:\s*\n?\s*(\d{2}/\d{2}/\d{4})", texto, re.I)
+    return match.group(1)[3:] if match else ""
+
+
+def numero_br(valor):
+    return texto_para_numero(valor)
+
+
+def processar_extrato_bradesco(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    dados = extrair_blocos_total_bradesco(texto_original)
+    blocos = dados["blocos"]
+
+    resultado = {coluna: "" for coluna in COLUNAS}
+    resultado.update({
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": extrair_nome_cliente_bradesco(texto_original),
+        "Conta": extrair_conta_bradesco(texto_original),
+        "Mês": extrair_mes_bradesco(texto_original),
+        "Saldo Anterior": 0.0,
+        "Aplicações": 0.0,
+        "Resgates": 0.0,
+        "Rendimento bruto mês": 0.0,
+        "IRRF": 0.0,
+        "IOF": 0.0,
+        "Saldo Bruto": 0.0,
+        "Banco": "Bradesco",
+    })
+
+    if len(blocos) < 4:
+        return resultado
+
+    def valor(bloco, indice):
+        valores = bloco.get("valores", [])
+        return numero_br(valores[indice]) if len(valores) > indice else 0.0
+
+    bloco_saldo_anterior = blocos[0]
+    bloco_aplicacoes = blocos[1]
+    bloco_resgates = blocos[2]
+    bloco_saldo_final = blocos[-1]
+
+    # Índices após remover o 0,0000:
+    # 0 = Vlr. Princ.
+    # 1 = Vlr. Bruto
+    # 2 = Renda Total
+    # 3 = Vlr. IOF
+    # 4 = Vlr. IRRF
+    # 5 = Vlr. Líquido
+    # 6 = Renda Bruta Per
+
+    resultado["Saldo Anterior"] = valor(bloco_saldo_anterior, 1)
+    resultado["Aplicações"] = valor(bloco_aplicacoes, 0)
+    resultado["Resgates"] = valor(bloco_resgates, 5)
+    resultado["IRRF"] = valor(bloco_resgates, 4)
+    resultado["IOF"] = valor(bloco_resgates, 3)
+    resultado["Rendimento bruto mês"] = (
+        valor(bloco_resgates, 6)
+        + valor(bloco_saldo_final, 6)
+    )
+    resultado["Saldo Bruto"] = valor(bloco_saldo_final, 1)
+
+    return resultado
+
+
+
+
+def processar_extrato_sicredi_poupanca(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    texto = re.sub(r"\s+", " ", texto_original).strip()
+    saldo = re.search(r"SALDO ANTERIOR\s+([\d.]+,\d{2})", texto, re.I)
+    atual = re.search(r"SALDO ATUAL\s+([\d.]+,\d{2})", texto, re.I) or re.search(r"Saldo Bruto\s+([\d.]+,\d{2})", texto, re.I)
+    irrf = re.search(r"ENCARGOS DE IRRF\s+([\d.]+,\d{2})", texto, re.I) or re.search(r"IRRF\s+([\d.]+,\d{2})", texto, re.I)
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": extrair_cliente_sicredi(texto_original),
+        "Conta": extrair_conta_sicredi_poupanca(texto_original),
+        "Mês": extrair_mes_sicredi(texto_original),
+        "Saldo Anterior": texto_para_numero(saldo.group(1)) if saldo else 0.0,
+        "Aplicações": sum(texto_para_numero(m.group(1)) for m in re.finditer(r"APLICACAO POUPANCA\s+([\d.]+,\d{2})", texto, re.I)),
+        "Resgates": 0.0,
+        "Rendimento bruto mês": sum(texto_para_numero(m.group(1)) for m in re.finditer(r"CAPITALIZ\.\s+REND\.[^\d]*?([\d.]+,\d{2})", texto, re.I)),
+        "IRRF": texto_para_numero(irrf.group(1)) if irrf else 0.0,
+        "IOF": 0.0,
+        "Saldo Bruto": texto_para_numero(atual.group(1)) if atual else 0.0,
+        "Banco": nome_banco,
+    }
+
+
+def processar_extrato_sicredi_prazo(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    texto = re.sub(r"\s+", " ", texto_original).strip()
+
+    provisionado_anterior = re.search(
+        r"([\d.]+,\d{2})\s+\d{2}/\d{2}/\d{4}\s+Rendimentos Provisionados:",
+        texto,
+        re.I,
+    )
+
+    saldo_anterior = re.search(
+        r"([\d.]+,\d{2})\s+\d{2}/\d{2}/\d{4}\s+Saldo Anterior:",
+        texto,
+        re.I,
+    )
+
+    valor_provisionado_anterior = (
+        texto_para_numero(provisionado_anterior.group(1))
+        if provisionado_anterior
+        else 0.0
+    )
+
+    valor_saldo_anterior = (
+        texto_para_numero(saldo_anterior.group(1))
+        if saldo_anterior
+        else 0.0
+    )
+
+    saldo_anterior_total = valor_saldo_anterior + valor_provisionado_anterior
+
+    tabela = re.search(
+        r"(\d{2}/\d{4})\s+"
+        r"([\d.]+,\d{2})\s+"
+        r"([\d.]+,\d{2})\s+"
+        r"([\d.]+,\d{2})\s+"
+        r"([\d.]+,\d{2})\s+"
+        r"([\d.]+,\d{2})\s+"
+        r"([\d.]+,\d{2})\s+"
+        r"([\d.]+,\d{2})\s+"
+        r"([\d.]+,\d{2})",
+        texto,
+    )
+
+    pos = re.search(
+        r"Saldo Atual\s+([\d.]+,\d{2})\s*Rendimentos Provisionados",
+        texto,
+        re.I,
+    )
+
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": extrair_cliente_sicredi(texto_original),
+        "Conta": extrair_conta_sicredi_prazo(texto_original),
+        "Mês": extrair_mes_sicredi(texto_original),
+        "Saldo Anterior": saldo_anterior_total,
+        "Aplicações": texto_para_numero(tabela.group(2)) if tabela else 0.0,
+        "Resgates": texto_para_numero(tabela.group(3)) if tabela else 0.0,
+        "Rendimento bruto mês": texto_para_numero(tabela.group(7)) if tabela else 0.0,
+        "IRRF": texto_para_numero(tabela.group(5)) if tabela else 0.0,
+        "IOF": texto_para_numero(tabela.group(6)) if tabela else 0.0,
+        "Saldo Bruto": (
+            texto_para_numero(pos.group(1)) if pos else 0.0
+        ) + (
+            texto_para_numero(tabela.group(8)) if tabela else 0.0
+        ),
+        "Banco": nome_banco,
+    }
+
+
+def processar_extrato_xp(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    texto = re.sub(r"\s+", " ", texto_original).strip()
+    match = re.search(r"[a-z]+\./\d{2}\s+R\$\s*([\d.]+,\d{2})\s+R\$\s*([\d.-]+,\d{2})\s+-R\$\s*([\d.]+,\d{2})\s+R\$\s*([\d.]+,\d{2})\s+R\$\s*([\d.]+,\d{2})\s+R\$\s*([\d.]+,\d{2})", texto, re.I)
+    saldo_anterior = aplicacoes = resgates = rendimentos = irrf = iof = saldo_bruto = 0.0
+    if match:
+        saldo_anterior = texto_para_numero(match.group(1))
+        movimentacoes = texto_para_numero(match.group(2))
+        irrf = texto_para_numero(match.group(3))
+        iof = texto_para_numero(match.group(4))
+        saldo_bruto = texto_para_numero(match.group(5))
+        rendimentos = texto_para_numero(match.group(6))
+        if movimentacoes >= 0:
+            aplicacoes = movimentacoes
+        else:
+            resgates = abs(movimentacoes)
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": "",
+        "Conta": extrair_conta_xp(texto_original),
+        "Mês": extrair_mes_xp(texto_original),
+        "Saldo Anterior": saldo_anterior,
+        "Aplicações": aplicacoes,
+        "Resgates": resgates,
+        "Rendimento bruto mês": rendimentos,
+        "IRRF": irrf,
+        "IOF": iof,
+        "Saldo Bruto": saldo_bruto,
+        "Banco": nome_banco,
+    }
+
+
+def processar_extrato_itau(caminho_pdf: Path, nome_banco: str) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+    texto = re.sub(r"\s+", " ", texto_original).strip()
+    acumulado = re.search(r"Acum\.\s*M[eê]s\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})\s+([\d.]+,\d{2})", texto, re.I)
+    anterior = re.search(r"\b31/\d{2}/\d{4}\s+([\d.]+,\d{2})\s+[\d.]+,\d{2}\s+[\d.]+,\d{2}\s+[\d.]+,\d{2}\s+[\d.]+,\d{2}", texto)
+    linhas = [l.strip() for l in texto_original.splitlines() if l.strip()]
+    saldo_bruto = 0.0
+    for i, linha in enumerate(linhas):
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", linha) and i + 1 < len(linhas):
+            if re.fullmatch(r"[\d.]+,\d{2}", linhas[i + 1]):
+                saldo_bruto = texto_para_numero(linhas[i + 1])
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": extrair_cliente_itau(texto_original),
+        "Conta": extrair_conta_itau(texto_original),
+        "Mês": extrair_mes_itau(texto_original),
+        "Saldo Anterior": texto_para_numero(anterior.group(1)) if anterior else 0.0,
+        "Aplicações": texto_para_numero(acumulado.group(1)) if acumulado else 0.0,
+        "Resgates": texto_para_numero(acumulado.group(6)) if acumulado else 0.0,
+        "Rendimento bruto mês": texto_para_numero(acumulado.group(7)) if acumulado else 0.0,
+        "IRRF": texto_para_numero(acumulado.group(5)) if acumulado else 0.0,
+        "IOF": texto_para_numero(acumulado.group(4)) if acumulado else 0.0,
+        "Saldo Bruto": saldo_bruto,
+        "Banco": "Itaú",
+    }
+
+
+def processar_extrato_itau_fundos(
+    caminho_pdf: Path,
+    nome_banco: str,
+) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+
+    texto = texto_original.replace(
+        "\xa0",
+        " ",
+    )
+
+    conta = ""
+    cliente = ""
+
+    match_cabecalho = re.search(
+        r"Ag\./Conta\s+"
+        r"(\d{1,5})/(\d{1,20}-\d+)",
+        texto,
+        re.I,
+    )
+
+    if match_cabecalho:
+        conta = match_cabecalho.group(2)
+
+    match_cliente = re.search(
+        r"Folha\s+\d+/\d+\s*"
+        r"([^\n]+?)\s*"
+        r"FI\d+",
+        texto,
+        re.I,
+    )
+
+    if match_cliente:
+        cliente = formatar_nome(
+            match_cliente.group(1)
+        )
+
+    match_periodo = re.search(
+        r"Período:\s*"
+        r"\d{2}/\d{2}\s+a\s+"
+        r"(\d{2})/(\d{2})/(\d{4})",
+        texto,
+        re.I,
+    )
+
+    mes = ""
+
+    if match_periodo:
+        mes = (
+            f"{match_periodo.group(2)}/"
+            f"{match_periodo.group(3)}"
+        )
+
+    saldo_anterior = valor_itau_reais(
+        texto,
+        r"SALDO\s+BRUTO\s+ANTERIOR",
+    )
+    
+    aplicacoes = valor_itau_reais(
+        texto,
+        r"APLICACOES",
+    )
+    
+    resgate_bruto = valor_itau_reais(
+        texto,
+        r"RESGATES",
+    )
+    
+    rendimento_mes = valor_itau_reais(
+        texto,
+        r"RENDIMENTO\s+BRUTO\s+NO\s+MES",
+    )
+    
+    saldo_bruto = valor_itau_reais(
+        texto,
+        r"SALDO\s+BRUTO\s+ATUAL",
+    )
+    
+    iof = valor_itau_reais(
+        texto,
+        r"TOTAL\s+SUJEITO\s+A\s+IOF",
+    )
+    
+    irrf = valor_itau_reais(
+        texto,
+        r"IR\s+RETIDO\s+NO\s+PERIODO",
+    )
+    
+    resgates_liquidos = max(
+        resgate_bruto - irrf,
+        0.0,
+    )
+
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": cliente,
+        "Conta": conta,
+        "Mês": mes,
+        "Saldo Anterior": saldo_anterior,
+        "Aplicações": aplicacoes,
+        "Resgates": resgates_liquidos,
+        "Rendimento bruto mês": rendimento_mes,
+        "IRRF": irrf,
+        "IOF": iof,
+        "Saldo Bruto": saldo_bruto,
+        "Banco": "Itaú",
+    }
+
+def processar_extrato_safra(
+    caminho_pdf: Path,
+    nome_banco: str,
+) -> dict:
+    texto_original = extrair_texto_pdf(caminho_pdf)
+
+    texto = texto_original.replace(
+        "\xa0",
+        " ",
+    )
+
+    conta = ""
+
+    match_conta = re.search(
+        r"Ag[êe]ncia:\s*\d+\s*/\s*"
+        r"Conta:\s*([^\n]+)",
+        texto,
+        re.I,
+    )
+
+    if match_conta:
+        conta = match_conta.group(1).strip()
+
+    mes = ""
+
+    match_data = re.search(
+        r"Data\s+da\s+posi[cç][ãa]o:\s*"
+        r"\d{2}/(\d{2})/(\d{4})",
+        texto,
+        re.I,
+    )
+
+    if match_data:
+        mes = (
+            f"{match_data.group(1)}/"
+            f"{match_data.group(2)}"
+        )
+
+    marcador_inicio = re.search(
+        r"Investimentos\s+Resumo\s+Composi[cç][ãa]o",
+        texto,
+        re.I,
+    )
+
+    if not marcador_inicio:
+        return {
+            "Arquivo": caminho_pdf.stem,
+            "Cliente": "",
+            "Banco": "Safra",
+            "Conta": conta,
+            "Mês": mes,
+            "Saldo Anterior": 0.0,
+            "Aplicações": 0.0,
+            "Resgates": 0.0,
+            "Rendimento bruto mês": 0.0,
+            "IRRF": 0.0,
+            "IOF": 0.0,
+            "Saldo Bruto": 0.0,
+        }
+
+    texto_composicao = texto[
+        marcador_inicio.end():
+    ]
+
+    marcador_renda_fixa = re.search(
+        r"\bRENDA\s+FIXA\b",
+        texto_composicao,
+        re.I,
+    )
+
+    if not marcador_renda_fixa:
+        return {
+            "Arquivo": caminho_pdf.stem,
+            "Cliente": "",
+            "Banco": "Safra",
+            "Conta": conta,
+            "Mês": mes,
+            "Saldo Anterior": 0.0,
+            "Aplicações": 0.0,
+            "Resgates": 0.0,
+            "Rendimento bruto mês": 0.0,
+            "IRRF": 0.0,
+            "IOF": 0.0,
+            "Saldo Bruto": 0.0,
+        }
+
+    texto_valores = texto_composicao[
+        marcador_renda_fixa.end():
+    ]
+
+    tokens = re.findall(
+        r"-|[0-9.]+,\d{2}",
+        texto_valores,
+    )
+
+    valores = []
+
+    for token in tokens:
+        if token == "-":
+            valores.append(0.0)
+        else:
+            valores.append(
+                texto_para_numero(token)
+            )
+
+        if len(valores) == 8:
+            break
+
+    while len(valores) < 8:
+        valores.append(0.0)
+
+    (
+        saldo_anterior,
+        aplicacoes,
+        resgates,
+        impostos_incorridos,
+        rendimento,
+        saldo_bruto,
+        impostos_previstos,
+        saldo_liquido,
+    ) = valores[:8]
+
+    return {
+        "Arquivo": caminho_pdf.stem,
+        "Cliente": "",
+        "Banco": "Safra",
+        "Conta": conta,
+        "Mês": mes,
+        "Saldo Anterior": saldo_anterior,
+        "Aplicações": aplicacoes,
+        "Resgates": resgates,
+        "Rendimento bruto mês": rendimento,
+        "IRRF": impostos_incorridos,
+        "IOF": 0.0,
+        "Saldo Bruto": saldo_bruto,
+    }
+
+
+
+
+
+
+# --------------------------------------------------------------------------
+# Varredura e exportação
+# --------------------------------------------------------------------------
+
+def encontrar_pastas_aplicacao(pasta_raiz: Path):
+    pastas = []
+    for pasta_banco in pasta_raiz.iterdir():
+        if not pasta_banco.is_dir():
+            continue
+        for sub in pasta_banco.iterdir():
+            if sub.is_dir() and sub.name.upper() in ("APLICAÇÃO", "APLICACAO"):
+                pastas.append((sub, pasta_banco.name))
+    return pastas
+
+
+def registro_erro(arquivo: Path, nome_banco: str, status: str, motivo: str) -> dict:
+    registro = {coluna: "" for coluna in COLUNAS}
+    registro["Arquivo"] = arquivo.stem
+    registro["Banco"] = nome_banco
+    registro["Status"] = status
+    registro["Motivo"] = motivo
+    return registro
+
+
+def registro_processado(registro: dict) -> dict:
+    registro["Status"] = "Processado"
+    registro["Motivo"] = ""
+    return registro
+
+
+def processar_arquivo(arquivo: Path, nome_banco: str) -> dict:
+    banco = nome_banco.lower()
+
+    if "001" in banco or "caixa" in banco:
+        return registro_processado(processar_extrato_caixa(arquivo, nome_banco))
+    if "bb" in banco or "banco do brasil" in banco:
+        texto = re.sub(r"\s+", " ", extrair_texto_pdf(arquivo)).strip()
+        if "Extratos - Investimentos Fundos - Mensal" in texto:
+            return registro_processado(processar_extrato_bb(arquivo, nome_banco))
+        return registro_processado(processar_extrato_bb_resumo(arquivo, nome_banco))
+    if "bradesco" in banco or "brad" in banco:
+        return registro_processado(processar_extrato_bradesco(arquivo, nome_banco))
+    if "sicredi" in banco:
+        texto = re.sub(r"\s+", " ", extrair_texto_pdf(arquivo)).strip()
+        if "Depósito a Prazo" in texto:
+            return registro_processado(processar_extrato_sicredi_prazo(arquivo, nome_banco))
+        return registro_processado(processar_extrato_sicredi_poupanca(arquivo, nome_banco))
+    if "safra" in banco:
+        texto = re.sub(
+            r"\s+",
+            " ",
+            extrair_texto_pdf(arquivo),
+        ).strip()
+    
+        if re.search(
+            r"Investimentos\s+Resumo\s+Composição",
+            texto,
+            re.I,
+        ):
+            return registro_processado(
+                processar_extrato_safra(
+                    arquivo,
+                    nome_banco,
+                )
+            )
+    
+        return registro_erro(
+            arquivo,
+            nome_banco,
+            "Modelo Safra não identificado",
+            "O PDF não contém o título Investimentos Resumo Composição.",
+        )
+    if "itau" in banco or "itaú" in banco:
+        texto_original = extrair_texto_pdf(arquivo)
+
+        texto = re.sub(
+            r"\s+",
+            " ",
+            texto_original,
+        ).strip()
+
+        if eh_itau_fundos_investimento(texto):
+            return registro_processado(
+                processar_extrato_itau_fundos(
+                    arquivo,
+                    nome_banco,
+                )
+            )
+    
+        return registro_processado(
+            processar_extrato_itau(
+                arquivo,
+                nome_banco,
+            )
+        )
+    if "xp" in banco:
+        return registro_processado(processar_extrato_xp(arquivo, nome_banco))
+
+    return registro_erro(
+        arquivo,
+        nome_banco,
+        "Banco não programado",
+        f"Não há processador cadastrado para o banco da pasta: {nome_banco}",
+    )
+
+
+def processar_todos_extratos(pasta_raiz: Path, callback=None):
+    pastas = encontrar_pastas_aplicacao(pasta_raiz)
+    if not pastas:
+        raise FileNotFoundError("Nenhuma pasta 'Aplicação' ou 'Aplicacao' encontrada.")
+
+    arquivos = [(pdf, banco) for pasta, banco in pastas for pdf in sorted(pasta.glob("*.pdf"))]
+    if not arquivos:
+        raise FileNotFoundError("Nenhum arquivo PDF encontrado nas pastas de aplicação.")
+
+    resultados = []
+    erros = []
+    total = len(arquivos)
+
+    for indice, (arquivo, nome_banco) in enumerate(arquivos, start=1):
+        if callback:
+            callback(indice - 1, total, arquivo.name)
+
+        try:
+            resultado = processar_arquivo(arquivo, nome_banco)
+            resultados.append(resultado)
+            if resultado["Status"] != "Processado":
+                erros.append(f"{arquivo.name}: {resultado['Motivo']}")
+        except Exception as erro:
+            motivo = str(erro) or "Falha não identificada durante a leitura do PDF."
+            resultados.append(registro_erro(arquivo, nome_banco, "Erro de leitura", motivo))
+            erros.append(f"{arquivo.name}: {motivo}")
+
+        if callback:
+            callback(indice, total, arquivo.name)
+
+    return resultados, erros
+
+
+def formatar_aba(ws, colunas: list[str], aplicar_moeda: bool = False):
+    preenchimento = PatternFill(fill_type="solid", fgColor=COR_CABECALHO)
+    fonte = Font(color="FFFFFF", bold=True)
+
+    for celula in ws[1]:
+        celula.fill = preenchimento
+        celula.font = fonte
+
+    if aplicar_moeda:
+        for linha in range(2, ws.max_row + 1):
+            for coluna, nome in enumerate(colunas, start=1):
+                if nome in COLUNAS_MONETARIAS:
+                    ws.cell(row=linha, column=coluna).number_format = "#,##0.00"
+
+    for coluna in ws.columns:
+        tamanho = max(len("" if celula.value is None else str(celula.value)) for celula in coluna)
+        ws.column_dimensions[coluna[0].column_letter].width = min(max(tamanho + 2, 12), 60)
+    
+    ws.column_dimensions["M"].width = 14
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
+def salvar_planilha(extratos: list[dict], pasta_saida: Path) -> Path:
+    if not extratos:
+        raise ValueError("Não há extratos para exportar.")
+
+    wb = Workbook()
+    ws_extratos = wb.active
+    ws_extratos.title = "Extratos"
+    ws_extratos.append(COLUNAS)
+
+    def chave_mes(registro):
+        mes = str(registro.get("Mês", "")).strip()
+
+        try:
+            numero_mes, ano = mes.split("/")
+            return int(ano), int(numero_mes)
+        except (ValueError, AttributeError):
+            return 9999, 99
+
+    extratos_processados = [
+        registro
+        for registro in extratos
+        if registro.get("Status") == "Processado"
+    ]
+
+    extratos_processados.sort(key=chave_mes)
+
+    for registro in extratos_processados:
+        proxima_linha = ws_extratos.max_row + 1
+
+        linha = []
+        for coluna in COLUNAS:
+            if coluna == "Check":
+                linha.append(
+                    f"=F{proxima_linha}+G{proxima_linha}-H{proxima_linha}"
+                    f"+I{proxima_linha}-J{proxima_linha}-K{proxima_linha}-L{proxima_linha}"
+                )
+            else:
+                linha.append(registro.get(coluna, ""))
+
+        ws_extratos.append(linha)
+
+    formatar_aba(ws_extratos, COLUNAS, aplicar_moeda=True)
+
+    ws_erros = wb.create_sheet("Erros de leitura")
+    ws_erros.append(COLUNAS_ERROS)
+
+    for registro in extratos:
+        if registro.get("Status") != "Processado":
+            ws_erros.append([
+                registro.get(coluna, "")
+                for coluna in COLUNAS_ERROS
+            ])
+
+    formatar_aba(ws_erros, COLUNAS_ERROS)
+
+    caminho_saida = pasta_saida / "extratos_aplicacao.xlsx"
+    wb.save(caminho_saida)
+    return caminho_saida
+
+
+# --------------------------------------------------------------------------
+# Interface
+# --------------------------------------------------------------------------
+
+def caminho_recurso(nome_arquivo: str) -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / nome_arquivo
+    return Path(__file__).resolve().parent / nome_arquivo
+
+
+def aplicar_icone_janela(janela: ctk.CTk) -> None:
+    caminho_icone = caminho_recurso("icone.ico")
+    if caminho_icone.exists():
+        try:
+            janela.iconbitmap(default=str(caminho_icone))
+        except Exception:
+            pass
+
+
+class LeitorExtratosApp:
+    STONE = "#636467"
+    CANVAS = "#E6E7E8"
+    WARM = "#BBBCAF"
+    LAND = "#934A37"
+    LAND_HOVER = "#7D3E30"
+    FUNDO_ESCURO = "#303133"
+    CARD_ESCURO = "#414245"
+    VERDE = "#3F7659"
+    VERMELHO = "#A33F35"
+
+    def __init__(self, raiz: ctk.CTk):
+        self.raiz = raiz
+        self.modo_escuro = True
+        self.logo = self.carregar_logo()
+        self.caminho_pasta = ctk.StringVar()
+        self.status = ctk.StringVar(value="Selecione a pasta dos extratos para iniciar.")
+        self.percentual = ctk.StringVar(value="0%")
+        self.resultado = ctk.StringVar(value="")
+        self.arquivo_saida: Path | None = None
+        self.raiz.title("ÍCONA | Leitor de Extratos - Planilha trimestral")
+        aplicar_icone_janela(self.raiz)
+        self.raiz.geometry("760x560")
+        self.raiz.minsize(680, 500)
+        self.raiz.resizable(True, True)
+        self.criar_interface()
+
+    def carregar_logo(self):
+        for nome in ["logo_icona.png", "LOGO_ICONA_PB_INVERSA.png", "LOGO_ICONA_PB_INVERSA.jpg", "LOGO_ICONA_PB_INVERSA-2.jpg"]:
+            caminho = caminho_recurso(nome)
+            if caminho.exists():
+                try:
+                    imagem = Image.open(caminho).convert("RGBA")
+                    imagem = ImageOps.contain(imagem, (115, 62), method=Image.Resampling.LANCZOS)
+                    return ctk.CTkImage(light_image=imagem, dark_image=imagem, size=imagem.size)
+                except Exception:
+                    pass
+        return None
+
+    def criar_interface(self):
+        quadro = ctk.CTkFrame(self.raiz, corner_radius=0, fg_color=(self.CANVAS, self.FUNDO_ESCURO))
+        quadro.pack(fill="both", expand=True)
+        quadro.grid_columnconfigure(0, weight=1)
+        quadro.grid_rowconfigure(1, weight=1)
+
+        cabecalho = ctk.CTkFrame(quadro, fg_color=self.LAND, corner_radius=0, height=90)
+        cabecalho.grid(row=0, column=0, sticky="ew")
+        cabecalho.grid_propagate(False)
+        cabecalho.grid_columnconfigure(1, weight=1)
+        if self.logo:
+            ctk.CTkLabel(cabecalho, text="", image=self.logo).grid(row=0, column=0, padx=(22, 13), pady=10)
+        else:
+            ctk.CTkLabel(cabecalho, text="ÍCONA", text_color="white", font=ctk.CTkFont(size=19, weight="bold")).grid(row=0, column=0, padx=(22, 13), pady=14)
+
+        textos = ctk.CTkFrame(cabecalho, fg_color="transparent")
+        textos.grid(row=0, column=1, sticky="w", pady=12)
+        ctk.CTkLabel(textos, text="Leitor de Extratos", text_color="white", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(textos, text="Extrai e salva as informações das aplicações", text_color="#F3E4DE", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(2, 0))
+
+        area = ctk.CTkFrame(quadro, fg_color="transparent")
+        area.grid(row=1, column=0, sticky="nsew", padx=22, pady=(18, 8))
+        area.grid_columnconfigure(0, weight=1)
+        card = ctk.CTkFrame(area, corner_radius=12, fg_color=("#FFFFFF", self.CARD_ESCURO), border_width=1, border_color=(self.WARM, self.STONE))
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Pasta dos extratos", text_color=(self.STONE, "#F5F5F5"), font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 3))
+        ctk.CTkLabel(card, text="Selecione a pasta raiz que contém as subpastas dos bancos.", text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 14))
+
+        linha = ctk.CTkFrame(card, fg_color="transparent")
+        linha.grid(row=2, column=0, sticky="ew", padx=18)
+        linha.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(linha, textvariable=self.caminho_pasta, height=34, corner_radius=7, border_color=(self.WARM, self.STONE), fg_color=("#FFFFFF", "#252627"), text_color=(self.STONE, "#F5F5F5")).grid(row=0, column=0, sticky="ew")
+        self.botao_selecionar = ctk.CTkButton(linha, text="Selecionar", command=self.selecionar_pasta, width=104, height=34, corner_radius=7, fg_color=(self.CANVAS, self.STONE), hover_color=(self.WARM, "#4F5053"), text_color=(self.STONE, "#F5F5F5"))
+        self.botao_selecionar.grid(row=0, column=1, padx=(9, 0))
+        self.botao_processar = ctk.CTkButton(card, text="Processar extratos", command=self.iniciar, height=38, corner_radius=8, fg_color=self.LAND, hover_color=self.LAND_HOVER, font=ctk.CTkFont(size=13, weight="bold"))
+        self.botao_processar.grid(row=3, column=0, sticky="w", padx=18, pady=(14, 17))
+
+        ctk.CTkLabel(area, textvariable=self.status, text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", pady=(10, 3))
+        self.progresso = ctk.CTkProgressBar(area, height=11, corner_radius=6, progress_color=self.LAND, fg_color=(self.WARM, self.STONE))
+        self.progresso.grid(row=2, column=0, sticky="ew")
+        self.progresso.set(0)
+        ctk.CTkLabel(area, textvariable=self.percentual, text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=11)).grid(row=3, column=0, sticky="e", pady=(2, 0))
+        self.label_resultado = ctk.CTkLabel(area, textvariable=self.resultado, justify="left", anchor="w", wraplength=700, text_color=(self.VERDE, "#7FC49B"), font=ctk.CTkFont(size=12))
+        self.label_resultado.grid(row=4, column=0, sticky="w", pady=(8, 3))
+        self.botao_abrir = ctk.CTkButton(area, text="Abrir planilha", command=self.abrir_planilha, state="disabled", width=126, height=32, corner_radius=8, fg_color=(self.CANVAS, self.STONE), hover_color=(self.WARM, "#4F5053"), text_color=(self.STONE, "#F5F5F5"))
+        self.botao_abrir.grid(row=5, column=0, sticky="w", pady=(2, 0))
+
+        rodape = ctk.CTkFrame(quadro, fg_color="transparent")
+        rodape.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 13))
+        rodape.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(rodape, text="ÍCONA Contabilidade • Uso licenciado • Distribuição proibida", text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.botao_tema = ctk.CTkButton(rodape, text="☀ Claro", command=self.alternar_tema, width=98, height=28, corner_radius=14, fg_color=(self.CANVAS, self.STONE), hover_color=(self.WARM, "#4F5053"), text_color=(self.STONE, "#F5F5F5"), font=ctk.CTkFont(size=11, weight="bold"))
+        self.botao_tema.grid(row=0, column=1, sticky="e")
+
+    def selecionar_pasta(self):
+        pasta = filedialog.askdirectory(title="Selecione a pasta raiz dos extratos", initialdir=self.caminho_pasta.get() or str(Path.home()))
+        if pasta:
+            self.caminho_pasta.set(pasta)
+            self.limpar_resultado()
+
+    def alternar_tema(self):
+        self.modo_escuro = not self.modo_escuro
+        ctk.set_appearance_mode("Dark" if self.modo_escuro else "Light")
+        self.botao_tema.configure(text="☀ Claro" if self.modo_escuro else "☾ Escuro")
+
+    def limpar_resultado(self):
+        self.arquivo_saida = None
+        self.status.set("Selecione a pasta dos extratos para iniciar.")
+        self.percentual.set("0%")
+        self.progresso.set(0)
+        self.resultado.set("")
+        self.botao_abrir.configure(state="disabled")
+
+    def iniciar(self):
+        pasta = Path(self.caminho_pasta.get().strip().strip('"')).expanduser()
+        if not pasta.is_dir():
+            messagebox.showerror("Pasta inválida", "Selecione uma pasta válida.")
+            return
+        for botao in [self.botao_processar, self.botao_selecionar, self.botao_abrir]:
+            botao.configure(state="disabled")
+        self.progresso.set(0)
+        self.percentual.set("0%")
+        self.status.set("Localizando PDFs...")
+        self.resultado.set("")
+        threading.Thread(target=self.executar, args=(pasta,), daemon=True).start()
+
+    def executar(self, pasta: Path):
+        try:
+            def callback(atual, total, nome):
+                self.raiz.after(0, lambda a=atual, t=total, n=nome: self.atualizar(a, t, n))
+
+            extratos, erros = processar_todos_extratos(pasta, callback)
+            self.arquivo_saida = salvar_planilha(extratos, pasta)
+            quantidade = len(extratos)
+            self.raiz.after(0, lambda q=quantidade, lista_erros=erros: self.sucesso(q, lista_erros))
+
+        except Exception as erro:
+            mensagem_erro = str(erro)
+            self.raiz.after(0, lambda mensagem=mensagem_erro: self.erro(mensagem))
+
+    def atualizar(self, atual, total, nome):
+        percentual = int(atual / total * 100) if total else 0
+        self.progresso.set(atual / total if total else 0)
+        self.percentual.set(f"{percentual}%")
+        self.status.set(f"Processando {atual} de {total}: {nome}")
+
+    def sucesso(self, total, erros):
+        self.progresso.set(1)
+        self.percentual.set("100%")
+        self.status.set("Processamento concluído.")
+        aviso = f"\n{len(erros)} arquivo(s) apresentaram erro e foram incluídos na planilha somente com nome e banco." if erros else ""
+        mensagem = f"Concluído: {total} arquivo(s) processado(s).{aviso}\nPlanilha criada: {self.arquivo_saida}"
+        self.resultado.set(mensagem)
+        self.botao_processar.configure(state="normal")
+        self.botao_selecionar.configure(state="normal")
+        self.botao_abrir.configure(state="normal")
+        messagebox.showinfo("Processamento concluído", mensagem)
+
+    def erro(self, mensagem):
+        self.status.set("Processamento não concluído.")
+        self.resultado.set(f"Erro: {mensagem}")
+        self.label_resultado.configure(text_color=(self.VERMELHO, "#E58C82"))
+        self.botao_processar.configure(state="normal")
+        self.botao_selecionar.configure(state="normal")
+        self.botao_abrir.configure(state="disabled")
+        messagebox.showerror("Erro no processamento", mensagem)
+
+    def abrir_planilha(self):
+        if not self.arquivo_saida or not self.arquivo_saida.exists():
+            messagebox.showwarning("Planilha não encontrada", "A planilha de resultado não está disponível.")
+            return
+        if sys.platform == "win32":
+            os.startfile(self.arquivo_saida)
+        elif sys.platform == "darwin":
+            os.system(f'open "{self.arquivo_saida}"')
+        else:
+            os.system(f'xdg-open "{self.arquivo_saida}"')
+
+
+def main():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("br.com.icona.leitor.extratos")
+        except Exception:
+            pass
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
+    raiz = ctk.CTk()
+    LeitorExtratosApp(raiz)
+    raiz.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
+
